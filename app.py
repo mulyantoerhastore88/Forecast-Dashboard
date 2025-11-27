@@ -13,7 +13,7 @@ import traceback
 
 st.set_page_config(page_title="Final Forecast Dashboard", layout="wide", page_icon="📈")
 
-# Link Google Sheet Utama
+# Link Single Google Sheet (WAJIB DIPASTIKAN SUDAH BENAR)
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1PuoII49N-IWOaNO8fSMYGwuvFf1T68_Kez30WN9q8Ds/edit"
 
 # Nama Tab di Google Sheet (WAJIB SAMA PERSIS)
@@ -35,7 +35,6 @@ def get_service_account():
             st.error("❌ Secrets 'gcp_service_account' tidak ditemukan!")
             return None
         creds = st.secrets["gcp_service_account"]
-        # Ini adalah titik kritis. Jika format key salah, error terjadi di sini.
         gc = gspread.service_account_from_dict(dict(creds))
         return gc
     except Exception as e:
@@ -57,7 +56,7 @@ def load_sheet_data(url, sheet_name):
             st.warning(f"⚠️ Data kosong di tab: {sheet_name}")
             return pd.DataFrame()
             
-        headers = [h.strip() for h in data[0]] # Clean header
+        headers = [h.strip() for h in data[0]] 
         df = pd.DataFrame(data[1:], columns=headers)
         
         st.success(f"✅ Loaded {sheet_name}: {len(df)} rows, {len(df.columns)} cols")
@@ -67,7 +66,6 @@ def load_sheet_data(url, sheet_name):
         st.error(f"❌ Tab '{sheet_name}' tidak ditemukan! Cek nama tab di Google Sheet.")
         return pd.DataFrame()
     except Exception as e:
-        # Ini akan menangkap error "Permission denied" jika kunci benar tapi akses salah
         st.error(f"❌ Error load {sheet_name}: {str(e)}. Pastikan email Service Account sudah dishare (Viewer).")
         return pd.DataFrame()
 
@@ -85,6 +83,10 @@ def extract_date_columns(columns):
 
 @st.cache_data
 def process_data(df_rofo, df_po, df_sales):
+    """
+    Fungsi utama untuk memproses 3 data (Rofo Horizontal, PO Vertical, Sales Horizontal)
+    dan menggabungkannya berdasarkan SKU dan Bulan.
+    """
     
     # ========== A. PROCESS ROFO (HORIZONTAL) ==========
     rofo_sku_col = 'SKU SAP'
@@ -123,6 +125,7 @@ def process_data(df_rofo, df_po, df_sales):
     if po_qty_col not in df_po.columns:
          if 'Order Quantity' in df_po.columns:
              po_qty_col = 'Order Quantity'
+             st.info("ℹ️ Menggunakan kolom 'Order Quantity' sebagai Kuantitas PO.")
          else:
              st.error("❌ Kolom kuantitas PO ('Quantity' atau 'Order Quantity') tidak ditemukan.")
              return pd.DataFrame()
@@ -165,6 +168,7 @@ def process_data(df_rofo, df_po, df_sales):
     df_merged['FAR'] = df_merged.apply(calc_far, axis=1)
     df_merged['Bias'] = df_merged['ROFO_Qty'] - df_merged['Actual_Qty']
     
+    # Status Logic (80%-120% rule)
     df_merged['Status'] = np.select(
         [
             (df_merged['ROFO_Qty'] == 0) & (df_merged['Actual_Qty'] > 0),
@@ -328,7 +332,7 @@ def create_dashboard(df):
 def main():
     st.sidebar.title("📌 Final Checklist")
     st.sidebar.markdown("""
-    **1. Secrets:** Pastikan Private Key Service Account di-copy ke Streamlit Secrets.
+    **1. Secrets:** Pastikan Private Key Service Account di-copy ke Streamlit Secrets (format satu baris).
     **2. Sharing:** Pastikan email `test-66@...` di-Share (Viewer) ke GSheet ini.
     **3. Tab Name:** Pastikan tab di GSheet bernama `Rofo`, `PO`, `Sales`.
     """)
@@ -336,13 +340,23 @@ def main():
     st.title("📈 Forecast Accuracy & Performance Dashboard")
     st.markdown(f"Data Source: [Google Sheet]({SPREADSHEET_URL})")
 
-    # Ambil data (atau dari cache)
-    df_final = process_all_data()
+    # --- 1. LOAD DATA ---
+    df_rofo = load_sheet_data(SPREADSHEET_URL, SHEET_CONFIG['rofo'])
+    df_po = load_sheet_data(SPREADSHEET_URL, SHEET_CONFIG['po'])
+    df_sales = load_sheet_data(SPREADSHEET_URL, SHEET_CONFIG['sales'])
 
+    # --- 2. VALIDATION & PROCESSING ---
+    if df_rofo.empty or df_po.empty:
+        st.error("⚠️ Dashboard tidak dapat ditampilkan. Cek pesan error di atas (Koneksi GSheet).")
+        return
+
+    df_final = process_data(df_rofo, df_po, df_sales)
+
+    # --- 3. DISPLAY ---
     if df_final is not None and not df_final.empty:
         create_dashboard(df_final)
     else:
-        st.error("⚠️ Dashboard tidak dapat ditampilkan. Cek pesan error di atas untuk panduan.")
+        st.error("⚠️ Gagal memproses data atau data kosong setelah penggabungan.")
 
 
 if __name__ == "__main__":
