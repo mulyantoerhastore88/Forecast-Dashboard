@@ -1,6 +1,5 @@
-# File: requirements.txt
 streamlit
 pandas
 gspread
 oauth2client 
-altair           <-- TAMBAHAN INI
+altair 
