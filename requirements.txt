@@ -1,0 +1,4 @@
+streamlit
+pandas
+gspread # Library untuk koneksi ke Google Sheets
+oauth2client # Dependency untuk gspread
