@@ -11,13 +11,12 @@ import traceback
 # 0. KONFIGURASI APLIKASI
 # -------------------------------------------------------------------
 
-# Set page config di awal
-st.set_page_config(page_title="Advanced Forecast Dashboard", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Final Forecast Dashboard", layout="wide", page_icon="📈")
 
-# Link Single Google Sheet
+# Link Google Sheet Utama
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1PuoII49N-IWOaNO8fSMYGwuvFf1T68_Kez30WN9q8Ds/edit"
 
-# Nama Tab di Google Sheet (WAJIB SESUAIKAN JIKA BEDA)
+# Nama Tab di Google Sheet (WAJIB SAMA PERSIS)
 SHEET_CONFIG = {
     'rofo': 'Rofo',
     'po': 'PO',
@@ -30,16 +29,17 @@ SHEET_CONFIG = {
 
 @st.cache_resource
 def get_service_account():
-    """Load Service Account dari secrets.toml"""
+    """Load Service Account dengan error handling terbaik."""
     try:
         if "gcp_service_account" not in st.secrets:
-            st.error("❌ Secrets 'gcp_service_account' tidak ditemukan! Silakan masukkan ke Streamlit Secrets.")
+            st.error("❌ Secrets 'gcp_service_account' tidak ditemukan!")
             return None
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        gc = gspread.service_account_from_dict(creds_dict)
+        creds = st.secrets["gcp_service_account"]
+        # Ini adalah titik kritis. Jika format key salah, error terjadi di sini.
+        gc = gspread.service_account_from_dict(dict(creds))
         return gc
     except Exception as e:
-        st.error(f"❌ Error service account: Pastikan format TOML key sudah benar. Error: {str(e)}")
+        st.error(f"❌ Gagal koneksi kunci Service Account. Error: {str(e)}. Cek format TOML di Streamlit Secrets.")
         return None
 
 @st.cache_data(ttl=600) # Cache 10 menit
@@ -58,8 +58,7 @@ def load_sheet_data(url, sheet_name):
             return pd.DataFrame()
             
         headers = [h.strip() for h in data[0]] # Clean header
-        rows = data[1:]
-        df = pd.DataFrame(rows, columns=headers)
+        df = pd.DataFrame(data[1:], columns=headers)
         
         st.success(f"✅ Loaded {sheet_name}: {len(df)} rows, {len(df.columns)} cols")
         return df
@@ -68,172 +67,130 @@ def load_sheet_data(url, sheet_name):
         st.error(f"❌ Tab '{sheet_name}' tidak ditemukan! Cek nama tab di Google Sheet.")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"❌ Error load {sheet_name}: {str(e)}")
+        # Ini akan menangkap error "Permission denied" jika kunci benar tapi akses salah
+        st.error(f"❌ Error load {sheet_name}: {str(e)}. Pastikan email Service Account sudah dishare (Viewer).")
         return pd.DataFrame()
 
 def extract_date_columns(columns):
-    """Mendeteksi kolom tanggal secara fleksibel."""
+    """Mendeteksi kolom tanggal secara fleksibel (untuk Rofo/Sales)."""
     date_cols = []
-    # Mencari pola 'YYYY-MM-DD', 'DD-MM-YYYY', 'YYYY', atau kata bulan (Jan/Feb)
     for col in columns:
         if re.search(r'(202\d)|(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', col): 
             date_cols.append(col)
     return date_cols
 
 # -------------------------------------------------------------------
-# 3. PROCESS DATA (CORE LOGIC)
+# 2. DATA PROCESSING ENGINE
 # -------------------------------------------------------------------
 
 @st.cache_data
-def process_all_data():
-    """Process data Rofo (horizontal) + PO (vertical) + Sales (horizontal)"""
+def process_data(df_rofo, df_po, df_sales):
     
-    with st.spinner("🔄 Memuat dan memproses data dari Google Sheets..."):
-        df_rofo = load_sheet_data(SPREADSHEET_URL, SHEET_CONFIG['rofo'])
-        df_po = load_sheet_data(SPREADSHEET_URL, SHEET_CONFIG['po'])
-        df_sales = load_sheet_data(SPREADSHEET_URL, SHEET_CONFIG['sales'])
+    # ========== A. PROCESS ROFO (HORIZONTAL) ==========
+    rofo_sku_col = 'SKU SAP'
+    if rofo_sku_col not in df_rofo.columns:
+        st.error(f"❌ Kolom '{rofo_sku_col}' tidak ditemukan di data Rofo.")
+        return pd.DataFrame()
+        
+    month_cols = extract_date_columns(df_rofo.columns)
+    if not month_cols:
+        st.error("❌ Kolom bulan (tanggal) tidak ditemukan di data Rofo.")
+        return pd.DataFrame()
 
-    if df_rofo.empty or df_po.empty:
-        st.error("❌ Data Rofo atau PO kosong, tidak bisa melanjutkan.")
-        return None
+    id_cols = [c for c in df_rofo.columns if c not in month_cols]
+    
+    df_rofo_long = df_rofo.melt(
+        id_vars=id_cols, 
+        value_vars=month_cols,
+        var_name='Month_Raw', 
+        value_name='ROFO_Qty'
+    ).rename(columns={rofo_sku_col: 'SKU'})
+    
+    df_rofo_long['ROFO_Qty'] = pd.to_numeric(df_rofo_long['ROFO_Qty'], errors='coerce').fillna(0).clip(lower=0)
+    df_rofo_long["Date"] = pd.to_datetime(df_rofo_long["Month_Raw"], errors='coerce').dt.to_period('M')
+    df_rofo_final = df_rofo_long.groupby(["SKU", "Date"])['ROFO_Qty'].sum().reset_index()
 
-    try:
-        # ========== A. PROCESS ROFO (HORIZONTAL) ==========
-        rofo_sku_col = 'SKU SAP'
-        if rofo_sku_col not in df_rofo.columns:
-            st.error(f"❌ Kolom '{rofo_sku_col}' tidak ditemukan di data Rofo.")
-            return None
+
+    # ========== B. PROCESS PO (VERTICAL) ==========
+    po_date_col = 'Document Date'
+    po_sku_col = 'SKU SAP'
+    po_qty_col = 'Quantity'
+    
+    if po_date_col not in df_po.columns or po_sku_col not in df_po.columns:
+        st.error("❌ Kolom kunci PO ('Document Date' atau 'SKU SAP') tidak ditemukan.")
+        return pd.DataFrame()
+
+    if po_qty_col not in df_po.columns:
+         if 'Order Quantity' in df_po.columns:
+             po_qty_col = 'Order Quantity'
+         else:
+             st.error("❌ Kolom kuantitas PO ('Quantity' atau 'Order Quantity') tidak ditemukan.")
+             return pd.DataFrame()
+
+    df_po['Month'] = pd.to_datetime(df_po[po_date_col], errors='coerce').dt.to_period('M')
+    df_po['Actual_Qty'] = pd.to_numeric(df_po[po_qty_col], errors='coerce').fillna(0)
+    
+    df_po_final = df_po.groupby([po_sku_col, 'Month'])['Actual_Qty'].sum().reset_index().rename(columns={po_sku_col: 'SKU', 'Month': 'Date'})
+
+
+    # ========== C. PROCESS SALES (SECONDARY METRIC) ==========
+    sales_sku_col = 'SKU SAP'
+    df_sales_final = pd.DataFrame()
+    
+    if not df_sales.empty and sales_sku_col in df_sales.columns:
+        sales_month_cols = extract_date_columns(df_sales.columns)
+        if sales_month_cols:
+            df_sales_long = df_sales.melt(
+                id_vars=[sales_sku_col], 
+                value_vars=sales_month_cols, 
+                var_name='Month_Raw', 
+                value_name='Sales_Qty_Ref'
+            ).rename(columns={sales_sku_col: 'SKU'})
             
-        month_cols = extract_date_columns(df_rofo.columns)
-        if not month_cols:
-            st.error("❌ Kolom bulan (tanggal) tidak ditemukan di data Rofo.")
-            return None
-
-        id_cols = [col for col in df_rofo.columns if col not in month_cols]
-        df_rofo_long = df_rofo.melt(
-            id_vars=id_cols,
-            value_vars=month_cols,
-            var_name="Month_Raw",
-            value_name="ROFO_Qty"
-        ).rename(columns={rofo_sku_col: 'SKU'})
-
-        # Convert dan clean data Rofo
-        df_rofo_long["ROFO_Qty"] = pd.to_numeric(
-            df_rofo_long["ROFO_Qty"], errors="coerce"
-        ).fillna(0).clip(lower=0)
-        
-        # Flexibel date conversion (diasumsikan format 2025-01-25)
-        df_rofo_long["Date"] = pd.to_datetime(
-             df_rofo_long["Month_Raw"], errors='coerce'
-        ).dt.to_period("M")
-        
-        df_rofo_long = df_rofo_long.dropna(subset=["Date"])
-        df_rofo_final = df_rofo_long.groupby(["SKU", "Date"])["ROFO_Qty"].sum().reset_index()
+            df_sales_long['Sales_Qty_Ref'] = pd.to_numeric(df_sales_long['Sales_Qty_Ref'], errors='coerce').fillna(0).clip(lower=0)
+            df_sales_long['Date'] = pd.to_datetime(df_sales_long['Month_Raw'], errors='coerce').dt.to_period('M')
+            df_sales_final = df_sales_long.groupby(['SKU', 'Date'])['Sales_Qty_Ref'].sum().reset_index()
 
 
-        # ========== B. PROCESS PO (VERTICAL) ==========
-        po_required_cols = ['Document Date', 'SKU SAP', 'Quantity'] # Asumsi Quantity = Actual Qty
-        missing_cols = [col for col in po_required_cols if col not in df_po.columns]
-        
-        if missing_cols:
-             # Cek fallback Order Quantity
-             if 'Order Quantity' in df_po.columns and 'Quantity' in missing_cols:
-                 po_required_cols[-1] = 'Order Quantity'
-                 st.info("ℹ️ Menggunakan kolom 'Order Quantity' sebagai Kuantitas PO.")
-             else:
-                 st.error(f"❌ Kolom PO tidak ditemukan: {missing_cols}")
-                 return None
-
-        df_po_clean = df_po.copy()
-        df_po_clean["Actual_Qty"] = pd.to_numeric(
-            df_po_clean[po_required_cols[-1]], errors="coerce"
-        ).fillna(0).clip(lower=0)
-        
-        # Convert Document Date ke Period
-        df_po_clean["Date"] = pd.to_datetime(
-            df_po_clean["Document Date"], errors="coerce"
-        ).dt.to_period("M")
-        
-        df_po_clean = df_po_clean.dropna(subset=["Date"])
-        df_po_grouped = df_po_clean.groupby(["SKU SAP", "Date"])["Actual_Qty"].sum().reset_index().rename(columns={"SKU SAP": "SKU"})
-
-
-        # ========== C. MERGE ROFO + PO & CALCULATE METRICS ==========
-        df_merged = pd.merge(
-            df_rofo_final,
-            df_po_grouped,
-            on=["SKU", "Date"],
-            how="outer"
-        ).fillna(0)
-        
-        df_merged = df_merged[(df_merged["ROFO_Qty"] > 0) | (df_merged["Actual_Qty"] > 0)]
-
-        # --- Metrics ---
-        def calculate_far(row):
-            if row["ROFO_Qty"] == 0:
-                return 0.0
-            return row["Actual_Qty"] / row["ROFO_Qty"]
-
-        df_merged["FAR"] = df_merged.apply(calculate_far, axis=1)
-        df_merged["Bias"] = df_merged["ROFO_Qty"] - df_merged["Actual_Qty"]
-
-        # Status Logic
-        df_merged['Status'] = np.select(
-            [
-                (df_merged['ROFO_Qty'] == 0) & (df_merged['Actual_Qty'] > 0),
-                (df_merged['ROFO_Qty'] > 0) & (df_merged['Actual_Qty'] == 0),
-                (df_merged['FAR'] >= 0.8) & (df_merged['FAR'] <= 1.2),
-                (df_merged['FAR'] < 0.8),
-                (df_merged['FAR'] > 1.2)
-            ],
-            [
-                "Unforecasted Demand", # Actual > 0, Forecast = 0
-                "Missed (No Supply)",  # Forecast > 0, Actual = 0
-                "Accurate (80-120%)", 
-                "Under-Delivery",
-                "Over-Delivery"
-            ],
-            default="No Activity"
-        )
-        
-        df_merged["Month_Str"] = df_merged["Date"].astype(str)
-
-        # ========== D. PROCESS SALES (OPTIONAL) ==========
-        sales_data_dict = {}
-        sales_sku_col = 'SKU SAP'
-        if not df_sales.empty and sales_sku_col in df_sales.columns:
-            sales_month_cols = extract_date_columns(df_sales.columns)
-            if sales_month_cols:
-                df_sales_long = df_sales.melt(
-                    id_vars=[sales_sku_col],
-                    value_vars=sales_month_cols,
-                    var_name="Month_Raw",
-                    value_name="Sales_Qty"
-                ).rename(columns={sales_sku_col: 'SKU'})
-                
-                df_sales_long["Sales_Qty"] = pd.to_numeric(df_sales_long["Sales_Qty"], errors="coerce").fillna(0).clip(lower=0)
-                df_sales_long["Date"] = pd.to_datetime(df_sales_long["Month_Raw"], errors='coerce').dt.to_period("M")
-                df_sales_data = df_sales_long.groupby(["SKU", "Date"])["Sales_Qty"].sum().reset_index()
-                sales_data_dict['sales_data'] = df_sales_data.rename(columns={'Sales_Qty': 'Sales_Qty_Ref'})
-
-
-        # --- FINAL OUTPUT ---
-        final_df = pd.merge(df_merged, sales_data_dict.get('sales_data', pd.DataFrame()), on=['SKU', 'Date'], how='left').fillna({'Sales_Qty_Ref': 0})
-        
-        st.success(f"✅ Processing selesai: {len(final_df)} baris data gabungan.")
-        return final_df
-
-    except Exception as e:
-        st.error(f"❌ Error processing data: {str(e)}")
-        st.code(traceback.format_exc())
-        return None
+    # ========== D. MERGING & METRICS ==========
+    df_merged = pd.merge(df_rofo_final, df_po_final, on=['SKU', 'Date'], how='outer').fillna(0)
+    df_merged = pd.merge(df_merged, df_sales_final, on=['SKU', 'Date'], how='left').fillna(0)
+    
+    df_merged = df_merged[(df_merged['ROFO_Qty'] != 0) | (df_merged['Actual_Qty'] != 0) | (df_merged['Sales_Qty_Ref'] != 0)]
+    
+    # Metrics
+    def calc_far(row):
+        return row['Actual_Qty'] / row['ROFO_Qty'] if row['ROFO_Qty'] > 0 else 0.0
+    
+    df_merged['FAR'] = df_merged.apply(calc_far, axis=1)
+    df_merged['Bias'] = df_merged['ROFO_Qty'] - df_merged['Actual_Qty']
+    
+    df_merged['Status'] = np.select(
+        [
+            (df_merged['ROFO_Qty'] == 0) & (df_merged['Actual_Qty'] > 0),
+            (df_merged['ROFO_Qty'] > 0) & (df_merged['Actual_Qty'] == 0),
+            (df_merged['FAR'] >= 0.8) & (df_merged['FAR'] <= 1.2),
+            (df_merged['FAR'] < 0.8),
+            (df_merged['FAR'] > 1.2)
+        ],
+        [
+            "Unforecasted Demand", 
+            "Missed (No Supply)",  
+            "Accurate (80-120%)", 
+            "Under-Delivery",
+            "Over-Delivery"
+        ],
+        default="No Activity"
+    )
+    
+    df_merged['Month_Str'] = df_merged['Date'].astype(str)
+    return df_merged
 
 # -------------------------------------------------------------------
-# 4. DASHBOARD COMPONENTS
+# 3. DASHBOARD COMPONENTS
 # -------------------------------------------------------------------
 
 def create_dashboard(df):
-    """Create dashboard dengan data yang sudah diproses"""
     
     st.header("📊 Forecast Accuracy Dashboard")
     
@@ -292,7 +249,7 @@ def create_dashboard(df):
     st.divider()
     
     # ========== CHARTS ==========
-    tab_trend, tab_bias, tab_status = st.tabs(["📈 Monthly Trend", "🔥 Top Bias SKU", "📊 Status Distribution"])
+    tab_trend, tab_bias, tab_table = st.tabs(["📈 Monthly Trend", "🔥 Top Bias SKU", "📋 Detail Data"])
 
     with tab_trend:
         st.subheader("Tren Rofo vs Actual vs Sales")
@@ -313,7 +270,7 @@ def create_dashboard(df):
                 range=['#3498db', '#2ecc71', '#e74c3c']
             )),
             tooltip=['Month_Str', 'Metric', alt.Tooltip('Quantity:Q', format=',')]
-        ).properties(height=400, title="Monthly Trend (Rofo, PO, Sales)")
+        ).properties(height=400, title="Monthly Trend (Rofo, PO, Sales)").interactive()
         
         st.altair_chart(trend_chart, use_container_width=True)
 
@@ -332,60 +289,50 @@ def create_dashboard(df):
             y=alt.Y('SKU:N', sort=alt.EncodingSortField(field="Abs_Bias", order="descending"), title='SKU'),
             color=alt.condition(
                 alt.datum.Bias > 0,
-                alt.value('#e74c3c'), # Over Forecast (Merah)
-                alt.value('#27ae60') # Under Forecast (Hijau)
+                alt.value('#e74c3c'),
+                alt.value('#27ae60')
             ),
             tooltip=['SKU', alt.Tooltip('Bias:Q', format=',.0f'), alt.Tooltip('ROFO_Qty:Q', format=',.0f'), alt.Tooltip('Actual_Qty:Q', format=',.0f')]
         ).properties(height=400)
         
         st.altair_chart(bias_chart, use_container_width=True)
 
-    with tab_status:
-        st.subheader("Distribusi Status Akurasi (Per Periode SKU)")
-        status_dist = df_filtered['Status'].value_counts().reset_index()
-        status_dist.columns = ['Status', 'Count']
+    with tab_table:
+        st.subheader("Detail Data Gabungan")
+        display_cols = ['SKU', 'Month_Str', 'ROFO_Qty', 'Actual_Qty', 'Sales_Qty_Ref', 'FAR', 'Bias', 'Status']
         
-        status_colors = alt.Scale(domain=sorted(status_dist['Status'].tolist()), range=['#27ae60', '#f1c40f', '#e74c3c', '#8e44ad', '#34495e'])
-
-        status_chart = alt.Chart(status_dist).mark_bar().encode(
-            x=alt.X('Status:N', title='Status', sort='-y'),
-            y=alt.Y('Count:Q', title='Jumlah Periode SKU'),
-            color=alt.Color('Status:N', scale=status_colors),
-            tooltip=['Status', 'Count']
-        ).properties(height=400)
+        st.dataframe(
+            df_filtered[display_cols].sort_values(['Month_Str', 'SKU'])
+            .style.format({
+                'ROFO_Qty': '{:,.0f}', 
+                'Actual_Qty': '{:,.0f}', 
+                'Sales_Qty_Ref': '{:,.0f}',
+                'FAR': '{:.1%}',
+                'Bias': '{:,.0f}'
+            }), 
+            use_container_width=True
+        )
         
-        st.altair_chart(status_chart, use_container_width=True)
-
-
-    # --- DATA TABLE ---
-    st.markdown("### 📋 Detail Data Gabungan")
-    display_cols = ['SKU', 'Month_Str', 'ROFO_Qty', 'Actual_Qty', 'Sales_Qty_Ref', 'FAR', 'Bias', 'Status']
-    
-    st.dataframe(
-        df_filtered[display_cols].sort_values(['Month_Str', 'SKU'])
-        .style.format({
-            'ROFO_Qty': '{:,.0f}', 
-            'Actual_Qty': '{:,.0f}', 
-            'Sales_Qty_Ref': '{:,.0f}',
-            'FAR': '{:.1%}',
-            'Bias': '{:,.0f}'
-        }), 
-        use_container_width=True
-    )
-    
-    csv = df_filtered.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Filtered Data as CSV",
-        data=csv,
-        file_name=f"forecast_dashboard_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
+        csv = df_filtered.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Filtered Data as CSV",
+            data=csv,
+            file_name=f"forecast_dashboard_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
 
 # -------------------------------------------------------------------
-# 5. MAIN APP EXECUTION
+# 4. MAIN APP EXECUTION
 # -------------------------------------------------------------------
 
 def main():
+    st.sidebar.title("📌 Final Checklist")
+    st.sidebar.markdown("""
+    **1. Secrets:** Pastikan Private Key Service Account di-copy ke Streamlit Secrets.
+    **2. Sharing:** Pastikan email `test-66@...` di-Share (Viewer) ke GSheet ini.
+    **3. Tab Name:** Pastikan tab di GSheet bernama `Rofo`, `PO`, `Sales`.
+    """)
+    
     st.title("📈 Forecast Accuracy & Performance Dashboard")
     st.markdown(f"Data Source: [Google Sheet]({SPREADSHEET_URL})")
 
@@ -393,10 +340,9 @@ def main():
     df_final = process_all_data()
 
     if df_final is not None and not df_final.empty:
-        # Panggil dashboard dengan DataFrame yang sudah diproses
         create_dashboard(df_final)
     else:
-        st.warning("⚠️ Dashboard tidak dapat ditampilkan. Periksa pesan error di atas dan pastikan data di Google Sheet sudah terisi.")
+        st.error("⚠️ Dashboard tidak dapat ditampilkan. Cek pesan error di atas untuk panduan.")
 
 
 if __name__ == "__main__":
