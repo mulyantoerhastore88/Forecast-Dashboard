@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime
 import gspread
 from google.oauth2 import service_account
@@ -42,7 +40,10 @@ st.markdown("""
 class GoogleSheetsConnector:
     def __init__(self):
         self.credentials = self.get_credentials()
-        self.client = gspread.authorize(self.credentials)
+        if self.credentials:
+            self.client = gspread.authorize(self.credentials)
+        else:
+            self.client = None
         
     def get_credentials(self):
         """Mendapatkan credentials dari secrets.toml"""
@@ -72,6 +73,9 @@ class GoogleSheetsConnector:
     def get_sheet_data(self, sheet_url, sheet_name):
         """Mendapatkan data dari sheet tertentu"""
         try:
+            if not self.client:
+                return pd.DataFrame()
+                
             spreadsheet = self.client.open_by_url(sheet_url)
             worksheet = spreadsheet.worksheet(sheet_name)
             data = worksheet.get_all_records()
@@ -287,22 +291,54 @@ def main():
     # Initialize Google Sheets connector
     gs_connector = GoogleSheetsConnector()
     
-    if gs_connector.credentials is None:
+    if gs_connector.credentials is None or gs_connector.client is None:
         st.error("❌ Gagal mengakses Google Sheets. Periksa konfigurasi credentials.")
+        st.info("""
+        Pastikan:
+        1. File `secrets.toml` sudah dikonfigurasi dengan benar
+        2. Service account memiliki akses ke Google Sheets
+        3. Google Sheets sudah di-share dengan service account email
+        """)
         return
     
-    # URL Google Sheets dari folder yang diberikan
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1nno4Y5thUux03dAGemvF7SQBggqUf8Pp"  # Ganti dengan URL actual
+    # URL Google Sheets - GANTI DENGAN URL MU
+    SHEET_URL = "https://docs.google.com/spreadsheets/d/1YOUR_SHEET_ID_HERE"  # ⚠️ GANTI INI!
+    
+    # Input URL manual untuk testing
+    sheet_url_input = st.sidebar.text_input("Google Sheets URL:", value=SHEET_URL)
+    
+    if not sheet_url_input or "docs.google.com" not in sheet_url_input:
+        st.warning("⚠️ Masukkan URL Google Sheets yang valid")
+        st.info("""
+        Contoh URL: `https://docs.google.com/spreadsheets/d/1abc123def456...`
+        
+        Pastikan:
+        - Sheet sudah di-share dengan service account
+        - Sheet memiliki 3 worksheet: `master data`, `Rofo`, `Sales`
+        """)
+        return
     
     # Load data
     with st.spinner("🔄 Memuat data dari Google Sheets..."):
         try:
-            master_data = gs_connector.get_sheet_data(SHEET_URL, "master data")
-            rofo_data = gs_connector.get_sheet_data(SHEET_URL, "Rofo")
-            sales_data = gs_connector.get_sheet_data(SHEET_URL, "Sales")
+            master_data = gs_connector.get_sheet_data(sheet_url_input, "master data")
+            rofo_data = gs_connector.get_sheet_data(sheet_url_input, "Rofo")
+            sales_data = gs_connector.get_sheet_data(sheet_url_input, "Sales")
+            
+            if master_data.empty:
+                st.error("❌ Gagal memuat Master Data")
+            if rofo_data.empty:
+                st.error("❌ Gagal memuat Rofo Data")
+            if sales_data.empty:
+                st.error("❌ Gagal memuat Sales Data")
             
             if master_data.empty or rofo_data.empty or sales_data.empty:
-                st.error("❌ Gagal memuat data. Pastikan sheet URL benar dan memiliki akses.")
+                st.error("""
+                ❌ Gagal memuat data. Pastikan:
+                1. URL Google Sheets benar
+                2. Sheet sudah di-share dengan service account
+                3. Nama worksheet: 'master data', 'Rofo', 'Sales'
+                """)
                 return
             
             # Initialize analyzer
@@ -372,7 +408,7 @@ def show_dashboard_overview(analyzer):
         for issue in issues:
             st.warning(issue)
     
-    # Quick charts
+    # Quick charts menggunakan native Streamlit
     if not analyzer.sales_data.empty:
         col1, col2 = st.columns(2)
         
@@ -382,9 +418,8 @@ def show_dashboard_overview(analyzer):
                 category_sales = analyzer.sales_data.groupby('Category')[[col for col in analyzer.sales_data.columns 
                                                                     if col.startswith('Sales_')]].sum().sum(axis=1)
                 if not category_sales.empty:
-                    fig = px.pie(values=category_sales.values, names=category_sales.index, 
-                                title="Sales Distribution by Category")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.subheader("Sales by Category")
+                    st.dataframe(category_sales)
         
         with col2:
             # Top products
@@ -395,9 +430,8 @@ def show_dashboard_overview(analyzer):
                 top_products = sales_data.nlargest(10, 'Total_Sales')[['SKU_Name', 'Total_Sales']]
                 
                 if not top_products.empty:
-                    fig = px.bar(top_products, x='Total_Sales', y='SKU_Name', 
-                                orientation='h', title="Top 10 Products by Sales")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.subheader("Top 10 Products")
+                    st.dataframe(top_products)
 
 def show_sku_search(analyzer):
     """Halaman pencarian SKU"""
@@ -444,10 +478,8 @@ def show_sku_search(analyzer):
                 sales_row = sales_match.iloc[0]
                 rofo_row = rofo_match.iloc[0]
                 
-                # Prepare data for chart
-                months = [f'Month {i:02d}' for i in range(1, 12)]
-                sales_values = []
-                forecast_values = []
+                # Prepare data for display
+                comparison_data = []
                 
                 for i in range(1, 12):
                     sales_col = f'Sales_{i:02d}'
@@ -456,18 +488,16 @@ def show_sku_search(analyzer):
                     sales_val = sales_row[sales_col] if sales_col in sales_row else 0
                     forecast_val = rofo_row[forecast_col] if forecast_col in rofo_row else 0
                     
-                    sales_values.append(sales_val)
-                    forecast_values.append(forecast_val)
+                    comparison_data.append({
+                        'Month': f'Month {i:02d}',
+                        'Sales': sales_val,
+                        'Forecast': forecast_val,
+                        'Variance': sales_val - forecast_val
+                    })
                 
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=months, y=sales_values, name='Actual Sales', line=dict(color='blue')))
-                fig.add_trace(go.Scatter(x=months, y=forecast_values, name='Forecast', line=dict(color='red', dash='dash')))
-                
-                fig.update_layout(title=f"Sales vs Forecast - {sku_info['product_name']}",
-                                xaxis_title="Month",
-                                yaxis_title="Quantity")
-                
-                st.plotly_chart(fig, use_container_width=True)
+                comparison_df = pd.DataFrame(comparison_data)
+                st.subheader("Sales vs Forecast Comparison")
+                st.dataframe(comparison_df)
 
 def show_forecast_accuracy(analyzer):
     """Halaman analisis akurasi forecast"""
@@ -486,15 +516,12 @@ def show_forecast_accuracy(analyzer):
         # Accuracy by month
         monthly_accuracy = accuracy_df[accuracy_columns].mean()
         
-        fig = px.line(x=range(1, 12), y=monthly_accuracy.values,
-                     labels={'x': 'Month', 'y': 'Accuracy %'},
-                     title="Forecast Accuracy by Month")
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Accuracy distribution
-        fig = px.histogram(accuracy_df[accuracy_columns].mean(axis=1),
-                          nbins=20, title="Distribution of SKU Accuracy")
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Accuracy by Month")
+        monthly_df = pd.DataFrame({
+            'Month': [f'Month {i:02d}' for i in range(1, 12)],
+            'Accuracy': monthly_accuracy.values
+        })
+        st.dataframe(monthly_df)
         
         # Low accuracy SKUs
         accuracy_df['Avg_Accuracy'] = accuracy_df[accuracy_columns].mean(axis=1)
@@ -503,6 +530,10 @@ def show_forecast_accuracy(analyzer):
         if not low_accuracy.empty:
             st.subheader("🚨 SKUs with Low Accuracy (<70%)")
             st.dataframe(low_accuracy[['SKU_SAP', 'Product_Name', 'Avg_Accuracy']].sort_values('Avg_Accuracy'))
+        
+        # Display full accuracy table
+        st.subheader("Full Accuracy Data")
+        st.dataframe(accuracy_df)
     
     else:
         st.warning("No accuracy data available")
@@ -514,23 +545,21 @@ def show_brand_analysis(analyzer):
     brand_performance = analyzer.get_brand_performance()
     
     if not brand_performance.empty:
+        st.subheader("Brand Performance Summary")
+        st.dataframe(brand_performance)
+        
+        # Display charts using native Streamlit
         col1, col2 = st.columns(2)
         
         with col1:
-            # Sales by brand
-            fig = px.bar(brand_performance, x='Brand', y='Total_Sales',
-                        title="Total Sales by Brand")
-            st.plotly_chart(fig, use_container_width=True)
+            st.subheader("Sales by Brand")
+            for _, row in brand_performance.iterrows():
+                st.write(f"**{row['Brand']}**: ${row['Total_Sales']:,.0f}")
         
         with col2:
-            # SKU count by brand
-            fig = px.pie(brand_performance, values='SKU_Count', names='Brand',
-                        title="SKU Distribution by Brand")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Detailed table
-        st.subheader("Brand Performance Details")
-        st.dataframe(brand_performance)
+            st.subheader("SKU Count by Brand")
+            for _, row in brand_performance.iterrows():
+                st.write(f"**{row['Brand']}**: {row['SKU_Count']} SKUs")
     
     else:
         st.warning("No brand performance data available")
@@ -558,6 +587,8 @@ def show_data_issues(analyzer):
                 if missing_master:
                     missing_df = analyzer.sales_data[analyzer.sales_data['SKU_SAP'].isin(missing_master)]
                     st.dataframe(missing_df[['Current_SKU', 'SKU_SAP', 'SKU_Name']].head(10))
+                else:
+                    st.info("✅ No missing mappings found")
             
             with col2:
                 st.subheader("SKUs with No Sales")
@@ -567,6 +598,8 @@ def show_data_issues(analyzer):
                     if zero_sales.any():
                         zero_sales_df = analyzer.sales_data[zero_sales]
                         st.dataframe(zero_sales_df[['Current_SKU', 'SKU_SAP', 'SKU_Name']].head(10))
+                    else:
+                        st.info("✅ No zero-sales SKUs found")
     
     else:
         st.success("✅ No major data issues found!")
@@ -578,36 +611,35 @@ def show_export_data(analyzer):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("📋 Export Master Data"):
+        if not analyzer.master_data.empty:
             csv = analyzer.master_data.to_csv(index=False)
             st.download_button(
-                label="Download Master Data CSV",
+                label="📋 Download Master Data",
                 data=csv,
                 file_name="master_data.csv",
                 mime="text/csv"
             )
     
     with col2:
-        if st.button("📈 Export Sales Data"):
+        if not analyzer.sales_data.empty:
             csv = analyzer.sales_data.to_csv(index=False)
             st.download_button(
-                label="Download Sales Data CSV",
+                label="📈 Download Sales Data",
                 data=csv,
                 file_name="sales_data.csv",
                 mime="text/csv"
             )
     
     with col3:
-        if st.button("🎯 Export Accuracy Report"):
-            accuracy_df = analyzer.calculate_forecast_accuracy()
-            if not accuracy_df.empty:
-                csv = accuracy_df.to_csv(index=False)
-                st.download_button(
-                    label="Download Accuracy Report CSV",
-                    data=csv,
-                    file_name="accuracy_report.csv",
-                    mime="text/csv"
-                )
+        accuracy_df = analyzer.calculate_forecast_accuracy()
+        if not accuracy_df.empty:
+            csv = accuracy_df.to_csv(index=False)
+            st.download_button(
+                label="🎯 Download Accuracy Report",
+                data=csv,
+                file_name="accuracy_report.csv",
+                mime="text/csv"
+            )
 
 if __name__ == "__main__":
     main()
