@@ -2,12 +2,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import gspread
-from google.oauth2 import service_account
+import io
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Konfigurasi halaman
 st.set_page_config(
-    page_title="SKU Management Dashboard",
+    page_title="Forecast Accuracy Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -27,156 +29,70 @@ st.markdown("""
         padding: 1rem;
         border-radius: 10px;
         border-left: 4px solid #1f77b4;
+        margin-bottom: 1rem;
     }
     .warning-card {
         background-color: #fff3cd;
         padding: 1rem;
         border-radius: 10px;
         border-left: 4px solid #ffc107;
+        margin-bottom: 1rem;
+    }
+    .success-card {
+        background-color: #d1ecf1;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #0c5460;
+        margin-bottom: 1rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-class GoogleSheetsConnector:
-    def __init__(self):
-        self.credentials = self.get_credentials()
-        if self.credentials:
-            self.client = gspread.authorize(self.credentials)
-        else:
-            self.client = None
-        
-    def get_credentials(self):
-        """Mendapatkan credentials dari secrets.toml"""
-        try:
-            # Create credentials from secrets
-            credentials_dict = {
-                "type": st.secrets["gcp_service_account"]["type"],
-                "project_id": st.secrets["gcp_service_account"]["project_id"],
-                "private_key_id": st.secrets["gcp_service_account"]["private_key_id"],
-                "private_key": st.secrets["gcp_service_account"]["private_key"].replace('\\n', '\n'),
-                "client_email": st.secrets["gcp_service_account"]["client_email"],
-                "client_id": st.secrets["gcp_service_account"]["client_id"],
-                "auth_uri": st.secrets["gcp_service_account"]["auth_uri"],
-                "token_uri": st.secrets["gcp_service_account"]["token_uri"],
-                "auth_provider_x509_cert_url": st.secrets["gcp_service_account"]["auth_provider_x509_cert_url"],
-                "client_x509_cert_url": st.secrets["gcp_service_account"]["client_x509_cert_url"]
-            }
-            credentials = service_account.Credentials.from_service_account_info(
-                credentials_dict,
-                scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-            )
-            return credentials
-        except Exception as e:
-            st.error(f"Error loading credentials: {e}")
-            return None
-    
-    def get_sheet_data(self, sheet_url, sheet_name):
-        """Mendapatkan data dari sheet tertentu"""
-        try:
-            if not self.client:
-                return pd.DataFrame()
-                
-            spreadsheet = self.client.open_by_url(sheet_url)
-            worksheet = spreadsheet.worksheet(sheet_name)
-            data = worksheet.get_all_records()
-            return pd.DataFrame(data)
-        except Exception as e:
-            st.error(f"Error getting data from {sheet_name}: {e}")
-            return pd.DataFrame()
-
-class SKUAnalyzer:
-    def __init__(self, master_data, rofo_data, sales_data):
-        self.master_data = master_data
+class ForecastAccuracyAnalyzer:
+    def __init__(self, rofo_data, sales_data, po_data=None):
         self.rofo_data = rofo_data
         self.sales_data = sales_data
+        self.po_data = po_data
         self.prepare_data()
     
     def prepare_data(self):
-        """Mempersiapkan dan membersihkan data"""
+        """Mempersiapkan dan membersihkan data untuk analisis forecast accuracy"""
         try:
-            # Clean master data
-            if not self.master_data.empty:
-                self.master_data.columns = ['Material', 'OLD_Material', 'SKU_SAP']
-                self.master_data = self.master_data.dropna(subset=['Material'])
-            
-            # Clean Rofo data
+            # Clean Rofo data (Forecast)
             if not self.rofo_data.empty:
-                # Get actual column names and map them
-                rofo_columns = ['SKU_GOA', 'SKU_SAP', 'Product_Name', 'Brand', 'Notes', 
-                               'Qty_Per_Box'] + [f'Forecast_{i:02d}' for i in range(1, 12)]
+                # Remove metadata rows and clean column names
+                self.rofo_data = self.rofo_data.iloc[1:]  # Remove header row
+                self.rofo_data.columns = ['SKU_GOA', 'SKU_SAP', 'Product_Name', 'Brand'] + [f'Forecast_{i:02d}' for i in range(1, 13)]
                 
-                # Use available columns
-                available_cols = min(len(rofo_columns), len(self.rofo_data.columns))
-                self.rofo_data.columns = rofo_columns[:available_cols] + list(self.rofo_data.columns[available_cols:])
-                self.rofo_data = self.rofo_data[self.rofo_data['SKU_SAP'] != 'SKU SAP']
+                # Convert forecast columns to numeric
+                for col in self.rofo_data.columns[4:]:
+                    self.rofo_data[col] = pd.to_numeric(self.rofo_data[col], errors='coerce')
             
             # Clean Sales data
             if not self.sales_data.empty:
-                sales_columns = ['Current_SKU', 'SKU_SAP', 'SKU_Old', 'SKU_Name', 'Brand', 
-                               'Category', 'SKU_Tier'] + [f'Sales_{i:02d}' for i in range(1, 12)]
+                # Remove metadata rows and clean column names
+                self.sales_data = self.sales_data.iloc[1:]  # Remove header row
+                self.sales_data.columns = ['Current_SKU', 'SKU_SAP', 'SKU_Old', 'SKU_Name', 'Brand', 
+                                         'Category', 'SKU_Tier'] + [f'Sales_{i:02d}' for i in range(1, 13)]
                 
-                available_cols = min(len(sales_columns), len(self.sales_data.columns))
-                self.sales_data.columns = sales_columns[:available_cols] + list(self.sales_data.columns[available_cols:])
-                self.sales_data = self.sales_data[~self.sales_data['Current_SKU'].astype(str).str.contains('Current SKU', na=False)]
+                # Convert sales columns to numeric
+                for col in self.sales_data.columns[7:]:
+                    self.sales_data[col] = pd.to_numeric(self.sales_data[col], errors='coerce')
             
-            # Create mapping dictionary
-            self.create_mappings()
+            # Clean PO data if available
+            if self.po_data is not None and not self.po_data.empty:
+                self.po_data = self.po_data.iloc[1:]  # Remove header row
+                self.po_data.columns = ['SKU_SAP'] + [f'PO_{i:02d}' for i in range(1, 12)]
+                
+                # Convert PO columns to numeric
+                for col in self.po_data.columns[1:]:
+                    self.po_data[col] = pd.to_numeric(self.po_data[col], errors='coerce')
             
         except Exception as e:
             st.error(f"Error preparing data: {e}")
     
-    def create_mappings(self):
-        """Membuat mapping dictionaries untuk akses cepat"""
-        self.sku_mapping = {}
-        if not self.master_data.empty:
-            for _, row in self.master_data.iterrows():
-                if pd.notna(row['Material']) and pd.notna(row['SKU_SAP']):
-                    self.sku_mapping[row['Material']] = row['SKU_SAP']
-                if pd.notna(row['OLD_Material']) and pd.notna(row['SKU_SAP']):
-                    self.sku_mapping[row['OLD_Material']] = row['SKU_SAP']
-    
-    def get_sku_info(self, sku):
-        """Mendapatkan informasi lengkap untuk sebuah SKU"""
-        info = {
-            'material': '',
-            'old_material': '',
-            'sku_sap': '',
-            'product_name': '',
-            'brand': '',
-            'category': '',
-            'found': False
-        }
-        
-        if not self.master_data.empty:
-            # Cari di master data
-            master_match = self.master_data[
-                (self.master_data['Material'] == sku) | 
-                (self.master_data['OLD_Material'] == sku) |
-                (self.master_data['SKU_SAP'] == sku)
-            ]
-            
-            if not master_match.empty:
-                info.update({
-                    'material': master_match.iloc[0]['Material'],
-                    'old_material': master_match.iloc[0]['OLD_Material'],
-                    'sku_sap': master_match.iloc[0]['SKU_SAP'],
-                    'found': True
-                })
-                
-                # Cari info tambahan di Sales data
-                if not self.sales_data.empty:
-                    sales_match = self.sales_data[self.sales_data['SKU_SAP'] == info['sku_sap']]
-                    if not sales_match.empty:
-                        info.update({
-                            'product_name': sales_match.iloc[0]['SKU_Name'],
-                            'brand': sales_match.iloc[0]['Brand'],
-                            'category': sales_match.iloc[0]['Category']
-                        })
-        
-        return info
-    
     def calculate_forecast_accuracy(self):
-        """Menghitung akurasi forecast vs actual sales"""
+        """Menghitung akurasi forecast vs actual sales dengan berbagai metrik"""
         accuracy_data = []
         
         if self.rofo_data.empty or self.sales_data.empty:
@@ -191,455 +107,492 @@ class SKUAnalyzer:
             if not sales_match.empty:
                 sales_row = sales_match.iloc[0]
                 
-                accuracy_row = {'SKU_SAP': sku_sap, 'Product_Name': rofo_row.get('Product_Name', '')}
+                accuracy_row = {
+                    'SKU_SAP': sku_sap, 
+                    'Product_Name': rofo_row.get('Product_Name', ''),
+                    'Brand': rofo_row.get('Brand', ''),
+                    'Total_Forecast': 0,
+                    'Total_Sales': 0,
+                    'Total_Absolute_Error': 0,
+                    'Months_With_Data': 0
+                }
+                
+                monthly_accuracy = []
                 
                 # Hitung accuracy per bulan
-                for i in range(1, 12):
+                for i in range(1, 12):  # 11 bulan sesuai data
                     forecast_col = f'Forecast_{i:02d}'
                     sales_col = f'Sales_{i:02d}'
                     
                     if forecast_col in rofo_row and sales_col in sales_row:
-                        forecast_val = rofo_row[forecast_col]
-                        sales_val = sales_row[sales_col]
+                        forecast_val = rofo_row[forecast_col] if pd.notna(rofo_row[forecast_col]) else 0
+                        sales_val = sales_row[sales_col] if pd.notna(sales_row[sales_col]) else 0
                         
+                        # Skip jika kedua nilai 0
+                        if forecast_val == 0 and sales_val == 0:
+                            continue
+                            
+                        accuracy_row['Total_Forecast'] += forecast_val
+                        accuracy_row['Total_Sales'] += sales_val
+                        accuracy_row['Total_Absolute_Error'] += abs(sales_val - forecast_val)
+                        accuracy_row['Months_With_Data'] += 1
+                        
+                        # Hitung accuracy untuk bulan ini
                         if pd.notna(forecast_val) and pd.notna(sales_val) and forecast_val != 0:
-                            try:
-                                accuracy = (1 - abs(sales_val - forecast_val) / forecast_val) * 100
-                                accuracy_row[f'Accuracy_{i:02d}'] = max(0, min(100, accuracy))
-                            except:
-                                accuracy_row[f'Accuracy_{i:02d}'] = None
+                            accuracy_pct = (1 - abs(sales_val - forecast_val) / forecast_val) * 100
+                            bias_pct = ((sales_val - forecast_val) / forecast_val) * 100 if forecast_val != 0 else 0
                         else:
-                            accuracy_row[f'Accuracy_{i:02d}'] = None
-                    else:
-                        accuracy_row[f'Accuracy_{i:02d}'] = None
+                            accuracy_pct = None
+                            bias_pct = None
+                        
+                        monthly_accuracy.append({
+                            'Month': i,
+                            'Forecast': forecast_val,
+                            'Sales': sales_val,
+                            'Accuracy_Pct': accuracy_pct,
+                            'Bias_Pct': bias_pct,
+                            'Absolute_Error': abs(sales_val - forecast_val)
+                        })
                 
-                accuracy_data.append(accuracy_row)
+                # Hitung metrik agregat
+                if accuracy_row['Months_With_Data'] > 0:
+                    if accuracy_row['Total_Forecast'] > 0:
+                        accuracy_row['Overall_Accuracy'] = (1 - accuracy_row['Total_Absolute_Error'] / accuracy_row['Total_Forecast']) * 100
+                        accuracy_row['Bias_Pct'] = ((accuracy_row['Total_Sales'] - accuracy_row['Total_Forecast']) / accuracy_row['Total_Forecast']) * 100
+                    else:
+                        accuracy_row['Overall_Accuracy'] = 0
+                        accuracy_row['Bias_Pct'] = 0
+                    
+                    accuracy_row['MAPE'] = (accuracy_row['Total_Absolute_Error'] / accuracy_row['Total_Sales']) * 100 if accuracy_row['Total_Sales'] > 0 else 0
+                    accuracy_row['MAE'] = accuracy_row['Total_Absolute_Error'] / accuracy_row['Months_With_Data']
+                    
+                    # Klasifikasi accuracy
+                    if accuracy_row['Overall_Accuracy'] >= 90:
+                        accuracy_row['Accuracy_Level'] = 'Excellent'
+                    elif accuracy_row['Overall_Accuracy'] >= 80:
+                        accuracy_row['Accuracy_Level'] = 'Good'
+                    elif accuracy_row['Overall_Accuracy'] >= 70:
+                        accuracy_row['Accuracy_Level'] = 'Fair'
+                    else:
+                        accuracy_row['Accuracy_Level'] = 'Poor'
+                    
+                    accuracy_row['Monthly_Details'] = monthly_accuracy
+                    accuracy_data.append(accuracy_row)
         
         return pd.DataFrame(accuracy_data)
     
-    def get_brand_performance(self):
-        """Analisis performa per brand"""
-        brand_data = []
-        
-        if self.sales_data.empty:
+    def get_brand_accuracy_summary(self, accuracy_df):
+        """Ringkasan akurasi per brand"""
+        if accuracy_df.empty:
             return pd.DataFrame()
         
-        for _, row in self.sales_data.iterrows():
-            if pd.notna(row.get('Brand')) and row.get('Brand') != 'Brand':
-                total_sales = 0
-                sales_cols = [col for col in self.sales_data.columns if col.startswith('Sales_')]
-                for col in sales_cols:
-                    if col in row and pd.notna(row[col]):
-                        total_sales += row[col]
-                
-                brand_data.append({
-                    'Brand': row['Brand'],
-                    'Category': row.get('Category', 'Unknown'),
-                    'Total_Sales': total_sales,
-                    'SKU_Count': 1
+        brand_summary = accuracy_df.groupby('Brand').agg({
+            'Overall_Accuracy': 'mean',
+            'Bias_Pct': 'mean',
+            'MAPE': 'mean',
+            'SKU_SAP': 'count',
+            'Total_Forecast': 'sum',
+            'Total_Sales': 'sum'
+        }).reset_index()
+        
+        brand_summary.columns = ['Brand', 'Avg_Accuracy', 'Avg_Bias', 'Avg_MAPE', 'SKU_Count', 'Total_Forecast', 'Total_Sales']
+        brand_summary['Accuracy_Level'] = brand_summary['Avg_Accuracy'].apply(
+            lambda x: 'Excellent' if x >= 90 else 'Good' if x >= 80 else 'Fair' if x >= 70 else 'Poor'
+        )
+        
+        return brand_summary.sort_values('Avg_Accuracy', ascending=False)
+    
+    def get_monthly_accuracy_trend(self, accuracy_df):
+        """Trend akurasi bulanan agregat"""
+        if accuracy_df.empty:
+            return pd.DataFrame()
+        
+        monthly_data = []
+        for _, row in accuracy_df.iterrows():
+            for month_data in row['Monthly_Details']:
+                monthly_data.append({
+                    'Month': month_data['Month'],
+                    'Accuracy_Pct': month_data['Accuracy_Pct'] if month_data['Accuracy_Pct'] is not None else 0,
+                    'Brand': row['Brand']
                 })
         
-        brand_df = pd.DataFrame(brand_data)
-        if not brand_df.empty:
-            brand_performance = brand_df.groupby(['Brand', 'Category']).agg({
-                'Total_Sales': 'sum',
-                'SKU_Count': 'count'
-            }).reset_index()
-            brand_performance['Avg_Sales_Per_SKU'] = brand_performance['Total_Sales'] / brand_performance['SKU_Count']
-            return brand_performance.sort_values('Total_Sales', ascending=False)
+        monthly_df = pd.DataFrame(monthly_data)
+        monthly_summary = monthly_df.groupby('Month')['Accuracy_Pct'].agg(['mean', 'std', 'count']).reset_index()
+        monthly_summary.columns = ['Month', 'Avg_Accuracy', 'Std_Deviation', 'Data_Points']
         
-        return pd.DataFrame()
+        return monthly_summary
     
-    def find_data_issues(self):
-        """Mencari issue dalam data"""
+    def identify_forecast_issues(self, accuracy_df):
+        """Mengidentifikasi issue dalam forecasting"""
         issues = []
         
-        if self.sales_data.empty or self.master_data.empty:
-            issues.append("⚠️ Data tidak lengkap")
+        if accuracy_df.empty:
             return issues
         
-        # SKU di Sales tapi tidak ada di Master Data
-        sales_skus = set(self.sales_data['SKU_SAP'].dropna())
-        master_skus = set(self.master_data['SKU_SAP'].dropna())
-        missing_master = sales_skus - master_skus
+        # SKU dengan accuracy rendah
+        low_accuracy = accuracy_df[accuracy_df['Overall_Accuracy'] < 70]
+        if len(low_accuracy) > 0:
+            issues.append(f"🚨 {len(low_accuracy)} SKU memiliki accuracy di bawah 70%")
         
-        if missing_master:
-            issues.append(f"🚨 {len(missing_master)} SKU di Sales tidak ada di Master Data")
+        # SKU dengan bias tinggi (over-forecast)
+        high_over_forecast = accuracy_df[accuracy_df['Bias_Pct'] < -20]
+        if len(high_over_forecast) > 0:
+            issues.append(f"📈 {len(high_over_forecast)} SKU over-forecast lebih dari 20%")
         
-        # SKU dengan forecast tapi tidak ada sales
-        if not self.rofo_data.empty:
-            rofo_skus = set(self.rofo_data['SKU_SAP'].dropna())
-            no_sales_forecast = rofo_skus - sales_skus
-            
-            if no_sales_forecast:
-                issues.append(f"⚠️ {len(no_sales_forecast)} SKU ada forecast tapi tidak ada sales data")
+        # SKU dengan bias tinggi (under-forecast)
+        high_under_forecast = accuracy_df[accuracy_df['Bias_Pct'] > 20]
+        if len(high_under_forecast) > 0:
+            issues.append(f"📉 {len(high_under_forecast)} SKU under-forecast lebih dari 20%")
         
-        # SKU dengan sales 0
-        sales_cols = [col for col in self.sales_data.columns if col.startswith('Sales_')]
-        if sales_cols:
-            zero_sales = self.sales_data[sales_cols].sum(axis=1) == 0
-            zero_sales_count = zero_sales.sum()
-            
-            if zero_sales_count > 0:
-                issues.append(f"📉 {zero_sales_count} SKU memiliki total sales 0")
+        # SKU tanpa data sales
+        no_sales_forecast = self.rofo_data[~self.rofo_data['SKU_SAP'].isin(self.sales_data['SKU_SAP'])]
+        if len(no_sales_forecast) > 0:
+            issues.append(f"⚠️ {len(no_sales_forecast)} SKU memiliki forecast tapi tidak ada data sales")
         
         return issues
 
 def main():
-    st.markdown('<h1 class="main-header">📊 SKU Management Dashboard</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">📊 Forecast Accuracy Dashboard</h1>', unsafe_allow_html=True)
     
-    # Initialize Google Sheets connector
-    gs_connector = GoogleSheetsConnector()
-    
-    if gs_connector.credentials is None or gs_connector.client is None:
-        st.error("❌ Gagal mengakses Google Sheets. Periksa konfigurasi credentials.")
-        st.info("""
-        Pastikan:
-        1. File `secrets.toml` sudah dikonfigurasi dengan benar
-        2. Service account memiliki akses ke Google Sheets
-        3. Google Sheets sudah di-share dengan service account email
-        """)
-        return
-    
-    # URL Google Sheets - GANTI DENGAN URL MU
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1YOUR_SHEET_ID_HERE"  # ⚠️ GANTI INI!
-    
-    # Input URL manual untuk testing
-    sheet_url_input = st.sidebar.text_input("Google Sheets URL:", value=SHEET_URL)
-    
-    if not sheet_url_input or "docs.google.com" not in sheet_url_input:
-        st.warning("⚠️ Masukkan URL Google Sheets yang valid")
-        st.info("""
-        Contoh URL: `https://docs.google.com/spreadsheets/d/1abc123def456...`
-        
-        Pastikan:
-        - Sheet sudah di-share dengan service account
-        - Sheet memiliki 3 worksheet: `master data`, `Rofo`, `Sales`
-        """)
-        return
-    
-    # Load data
-    with st.spinner("🔄 Memuat data dari Google Sheets..."):
-        try:
-            master_data = gs_connector.get_sheet_data(sheet_url_input, "master data")
-            rofo_data = gs_connector.get_sheet_data(sheet_url_input, "Rofo")
-            sales_data = gs_connector.get_sheet_data(sheet_url_input, "Sales")
-            
-            if master_data.empty:
-                st.error("❌ Gagal memuat Master Data")
-            if rofo_data.empty:
-                st.error("❌ Gagal memuat Rofo Data")
-            if sales_data.empty:
-                st.error("❌ Gagal memuat Sales Data")
-            
-            if master_data.empty or rofo_data.empty or sales_data.empty:
-                st.error("""
-                ❌ Gagal memuat data. Pastikan:
-                1. URL Google Sheets benar
-                2. Sheet sudah di-share dengan service account
-                3. Nama worksheet: 'master data', 'Rofo', 'Sales'
-                """)
-                return
+    # Load data langsung dari file yang diberikan
+    try:
+        with st.spinner("🔄 Memuat data dari file..."):
+            # Gunakan data yang sudah disediakan
+            rofo_data = pd.read_excel('Data (11).xlsx', sheet_name='Rofo(Forecast)')
+            sales_data = pd.read_excel('Data (11).xlsx', sheet_name='Sales')
+            po_data = pd.read_excel('Data (11).xlsx', sheet_name='PO')
             
             # Initialize analyzer
-            analyzer = SKUAnalyzer(master_data, rofo_data, sales_data)
+            analyzer = ForecastAccuracyAnalyzer(rofo_data, sales_data, po_data)
             
             st.success(f"✅ Data berhasil dimuat!")
-            st.info(f"📊 Summary: {len(master_data)} SKU Master, {len(rofo_data)} Forecast, {len(sales_data)} Sales")
-            
-        except Exception as e:
-            st.error(f"❌ Error memuat data: {e}")
-            return
+            st.info(f"📊 Summary: {len(rofo_data)} Forecast SKUs, {len(sales_data)} Sales SKUs")
+                
+    except Exception as e:
+        st.error(f"❌ Error memuat data: {str(e)}")
+        return
     
-    # Sidebar navigation
+    # Navigation
     st.sidebar.header("🔍 Navigation")
     page = st.sidebar.radio("Pilih Halaman:", 
-                          ["📈 Dashboard Overview", "🔍 SKU Search", "📊 Forecast Accuracy", 
-                           "🏷️ Brand Analysis", "🚨 Data Issues", "📥 Export Data"])
+                          ["📈 Dashboard Overview", "📊 Forecast Accuracy", "🏷️ Brand Analysis", 
+                           "📈 Monthly Trends", "🚨 Issue Analysis", "📥 Export Reports"])
     
     if page == "📈 Dashboard Overview":
         show_dashboard_overview(analyzer)
-    elif page == "🔍 SKU Search":
-        show_sku_search(analyzer)
     elif page == "📊 Forecast Accuracy":
         show_forecast_accuracy(analyzer)
     elif page == "🏷️ Brand Analysis":
         show_brand_analysis(analyzer)
-    elif page == "🚨 Data Issues":
-        show_data_issues(analyzer)
-    elif page == "📥 Export Data":
-        show_export_data(analyzer)
+    elif page == "📈 Monthly Trends":
+        show_monthly_trends(analyzer)
+    elif page == "🚨 Issue Analysis":
+        show_issue_analysis(analyzer)
+    elif page == "📥 Export Reports":
+        show_export_reports(analyzer)
 
 def show_dashboard_overview(analyzer):
     """Menampilkan dashboard overview"""
-    st.header("📈 Dashboard Overview")
+    st.header("📈 Forecast Accuracy Dashboard Overview")
     
-    # Metrics
+    # Calculate accuracy data
+    accuracy_df = analyzer.calculate_forecast_accuracy()
+    
+    if accuracy_df.empty:
+        st.warning("Tidak ada data accuracy yang dapat dihitung")
+        return
+    
+    # Key Metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        total_skus = len(analyzer.master_data) if not analyzer.master_data.empty else 0
-        st.metric("Total SKUs", f"{total_skus:,}")
+        overall_accuracy = accuracy_df['Overall_Accuracy'].mean()
+        st.metric("Overall Accuracy", f"{overall_accuracy:.1f}%")
     
     with col2:
-        if not analyzer.sales_data.empty:
-            active_products = len(analyzer.sales_data[~analyzer.sales_data['Current_SKU'].astype(str).str.contains('Discontinue', na=False)])
-        else:
-            active_products = 0
-        st.metric("Active Products", f"{active_products:,}")
+        avg_bias = accuracy_df['Bias_Pct'].mean()
+        bias_label = "Over-Forecast" if avg_bias < 0 else "Under-Forecast"
+        st.metric("Average Bias", f"{abs(avg_bias):.1f}%", bias_label)
     
     with col3:
-        forecast_skus = len(analyzer.rofo_data) if not analyzer.rofo_data.empty else 0
-        st.metric("SKUs with Forecast", f"{forecast_skus:,}")
+        excellent_accuracy = len(accuracy_df[accuracy_df['Overall_Accuracy'] >= 90])
+        st.metric("Excellent Accuracy (≥90%)", f"{excellent_accuracy} SKUs")
     
     with col4:
-        if not analyzer.sales_data.empty:
-            sales_cols = [col for col in analyzer.sales_data.columns if col.startswith('Sales_')]
-            total_sales = analyzer.sales_data[sales_cols].sum().sum() if sales_cols else 0
-        else:
-            total_sales = 0
-        st.metric("Total Sales", f"${total_sales:,.0f}")
+        poor_accuracy = len(accuracy_df[accuracy_df['Overall_Accuracy'] < 70])
+        st.metric("Poor Accuracy (<70%)", f"{poor_accuracy} SKUs")
     
-    # Data issues warning
-    issues = analyzer.find_data_issues()
-    if issues:
-        st.markdown("---")
-        st.subheader("🚨 Data Issues")
-        for issue in issues:
-            st.warning(issue)
-    
-    # Quick charts menggunakan native Streamlit
-    if not analyzer.sales_data.empty:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Sales by Category
-            if 'Category' in analyzer.sales_data.columns:
-                category_sales = analyzer.sales_data.groupby('Category')[[col for col in analyzer.sales_data.columns 
-                                                                    if col.startswith('Sales_')]].sum().sum(axis=1)
-                if not category_sales.empty:
-                    st.subheader("Sales by Category")
-                    st.dataframe(category_sales)
-        
-        with col2:
-            # Top products
-            sales_data = analyzer.sales_data.copy()
-            sales_cols = [col for col in sales_data.columns if col.startswith('Sales_')]
-            if sales_cols:
-                sales_data['Total_Sales'] = sales_data[sales_cols].sum(axis=1)
-                top_products = sales_data.nlargest(10, 'Total_Sales')[['SKU_Name', 'Total_Sales']]
-                
-                if not top_products.empty:
-                    st.subheader("Top 10 Products")
-                    st.dataframe(top_products)
-
-def show_sku_search(analyzer):
-    """Halaman pencarian SKU"""
-    st.header("🔍 SKU Search & Analysis")
-    
-    col1, col2 = st.columns([1, 2])
+    # Accuracy Distribution
+    col1, col2 = st.columns(2)
     
     with col1:
-        search_term = st.text_input("Enter SKU (Material/OLD Material/SKU SAP):")
-        
-        if search_term:
-            sku_info = analyzer.get_sku_info(search_term)
-            
-            if sku_info['found']:
-                st.success("✅ SKU Found!")
-                
-                st.subheader("SKU Information")
-                st.write(f"**Material:** {sku_info['material']}")
-                st.write(f"**OLD Material:** {sku_info['old_material']}")
-                st.write(f"**SKU SAP:** {sku_info['sku_sap']}")
-                st.write(f"**Product Name:** {sku_info['product_name']}")
-                st.write(f"**Brand:** {sku_info['brand']}")
-                st.write(f"**Category:** {sku_info['category']}")
-            else:
-                st.error("❌ SKU Not Found")
+        st.subheader("Accuracy Distribution")
+        accuracy_levels = accuracy_df['Accuracy_Level'].value_counts()
+        fig = px.pie(values=accuracy_levels.values, names=accuracy_levels.index,
+                    title="Distribution of Forecast Accuracy Levels")
+        st.plotly_chart(fig, use_container_width=True)
     
     with col2:
-        if search_term and sku_info['found']:
-            # Tampilkan sales vs forecast data
-            sku_sap = sku_info['sku_sap']
-            
-            # Get sales data
-            if not analyzer.sales_data.empty:
-                sales_match = analyzer.sales_data[analyzer.sales_data['SKU_SAP'] == sku_sap]
-            else:
-                sales_match = pd.DataFrame()
-                
-            if not analyzer.rofo_data.empty:
-                rofo_match = analyzer.rofo_data[analyzer.rofo_data['SKU_SAP'] == sku_sap]
-            else:
-                rofo_match = pd.DataFrame()
-            
-            if not sales_match.empty and not rofo_match.empty:
-                sales_row = sales_match.iloc[0]
-                rofo_row = rofo_match.iloc[0]
-                
-                # Prepare data for display
-                comparison_data = []
-                
-                for i in range(1, 12):
-                    sales_col = f'Sales_{i:02d}'
-                    forecast_col = f'Forecast_{i:02d}'
-                    
-                    sales_val = sales_row[sales_col] if sales_col in sales_row else 0
-                    forecast_val = rofo_row[forecast_col] if forecast_col in rofo_row else 0
-                    
-                    comparison_data.append({
-                        'Month': f'Month {i:02d}',
-                        'Sales': sales_val,
-                        'Forecast': forecast_val,
-                        'Variance': sales_val - forecast_val
-                    })
-                
-                comparison_df = pd.DataFrame(comparison_data)
-                st.subheader("Sales vs Forecast Comparison")
-                st.dataframe(comparison_df)
+        st.subheader("Accuracy vs Sales Volume")
+        fig = px.scatter(accuracy_df, x='Total_Sales', y='Overall_Accuracy', 
+                        color='Accuracy_Level', hover_data=['Product_Name'],
+                        title="Accuracy vs Sales Volume")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Recent Issues
+    st.subheader("🚨 Recent Forecast Issues")
+    issues = analyzer.identify_forecast_issues(accuracy_df)
+    for issue in issues:
+        st.warning(issue)
 
 def show_forecast_accuracy(analyzer):
-    """Halaman analisis akurasi forecast"""
-    st.header("📊 Forecast Accuracy Analysis")
+    """Halaman detail forecast accuracy"""
+    st.header("📊 Detailed Forecast Accuracy Analysis")
     
-    # Calculate accuracy
     accuracy_df = analyzer.calculate_forecast_accuracy()
     
-    if not accuracy_df.empty:
-        # Overall accuracy
-        accuracy_columns = [col for col in accuracy_df.columns if col.startswith('Accuracy_')]
-        overall_accuracy = accuracy_df[accuracy_columns].mean().mean()
-        
-        st.metric("Overall Forecast Accuracy", f"{overall_accuracy:.1f}%")
-        
-        # Accuracy by month
-        monthly_accuracy = accuracy_df[accuracy_columns].mean()
-        
-        st.subheader("Accuracy by Month")
-        monthly_df = pd.DataFrame({
-            'Month': [f'Month {i:02d}' for i in range(1, 12)],
-            'Accuracy': monthly_accuracy.values
-        })
-        st.dataframe(monthly_df)
-        
-        # Low accuracy SKUs
-        accuracy_df['Avg_Accuracy'] = accuracy_df[accuracy_columns].mean(axis=1)
-        low_accuracy = accuracy_df[accuracy_df['Avg_Accuracy'] < 70]
-        
-        if not low_accuracy.empty:
-            st.subheader("🚨 SKUs with Low Accuracy (<70%)")
-            st.dataframe(low_accuracy[['SKU_SAP', 'Product_Name', 'Avg_Accuracy']].sort_values('Avg_Accuracy'))
-        
-        # Display full accuracy table
-        st.subheader("Full Accuracy Data")
-        st.dataframe(accuracy_df)
+    if accuracy_df.empty:
+        st.warning("Tidak ada data accuracy yang dapat dihitung")
+        return
     
-    else:
-        st.warning("No accuracy data available")
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        accuracy_filter = st.selectbox("Filter by Accuracy Level:", 
+                                     ["All", "Excellent (≥90%)", "Good (80-89%)", "Fair (70-79%)", "Poor (<70%)"])
+    
+    with col2:
+        brands = ["All"] + sorted(accuracy_df['Brand'].unique().tolist())
+        brand_filter = st.selectbox("Filter by Brand:", brands)
+    
+    with col3:
+        min_sales = st.number_input("Minimum Sales Volume:", min_value=0, value=0)
+    
+    # Apply filters
+    filtered_df = accuracy_df.copy()
+    
+    if accuracy_filter != "All":
+        if accuracy_filter == "Excellent (≥90%)":
+            filtered_df = filtered_df[filtered_df['Overall_Accuracy'] >= 90]
+        elif accuracy_filter == "Good (80-89%)":
+            filtered_df = filtered_df[(filtered_df['Overall_Accuracy'] >= 80) & (filtered_df['Overall_Accuracy'] < 90)]
+        elif accuracy_filter == "Fair (70-79%)":
+            filtered_df = filtered_df[(filtered_df['Overall_Accuracy'] >= 70) & (filtered_df['Overall_Accuracy'] < 80)]
+        else:  # Poor
+            filtered_df = filtered_df[filtered_df['Overall_Accuracy'] < 70]
+    
+    if brand_filter != "All":
+        filtered_df = filtered_df[filtered_df['Brand'] == brand_filter]
+    
+    if min_sales > 0:
+        filtered_df = filtered_df[filtered_df['Total_Sales'] >= min_sales]
+    
+    # Display results
+    st.subheader(f"Forecast Accuracy Results ({len(filtered_df)} SKUs)")
+    
+    # Summary metrics for filtered data
+    if len(filtered_df) > 0:
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            avg_accuracy = filtered_df['Overall_Accuracy'].mean()
+            st.metric("Average Accuracy", f"{avg_accuracy:.1f}%")
+        
+        with col2:
+            avg_bias = filtered_df['Bias_Pct'].mean()
+            st.metric("Average Bias", f"{avg_bias:.1f}%")
+        
+        with col3:
+            total_forecast = filtered_df['Total_Forecast'].sum()
+            st.metric("Total Forecast Volume", f"{total_forecast:,.0f}")
+    
+    # Detailed table
+    display_cols = ['SKU_SAP', 'Product_Name', 'Brand', 'Overall_Accuracy', 'Bias_Pct', 
+                   'Accuracy_Level', 'Total_Forecast', 'Total_Sales']
+    
+    st.dataframe(filtered_df[display_cols].sort_values('Overall_Accuracy', ascending=False),
+                use_container_width=True)
 
 def show_brand_analysis(analyzer):
     """Halaman analisis brand"""
     st.header("🏷️ Brand Performance Analysis")
     
-    brand_performance = analyzer.get_brand_performance()
+    accuracy_df = analyzer.calculate_forecast_accuracy()
     
-    if not brand_performance.empty:
-        st.subheader("Brand Performance Summary")
-        st.dataframe(brand_performance)
-        
-        # Display charts using native Streamlit
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Sales by Brand")
-            for _, row in brand_performance.iterrows():
-                st.write(f"**{row['Brand']}**: ${row['Total_Sales']:,.0f}")
-        
-        with col2:
-            st.subheader("SKU Count by Brand")
-            for _, row in brand_performance.iterrows():
-                st.write(f"**{row['Brand']}**: {row['SKU_Count']} SKUs")
+    if accuracy_df.empty:
+        st.warning("Tidak ada data accuracy yang dapat dihitung")
+        return
     
-    else:
-        st.warning("No brand performance data available")
+    brand_summary = analyzer.get_brand_accuracy_summary(accuracy_df)
+    
+    if brand_summary.empty:
+        st.warning("Tidak ada data brand summary")
+        return
+    
+    # Brand Performance Metrics
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Brand Accuracy Ranking")
+        fig = px.bar(brand_summary, x='Avg_Accuracy', y='Brand', orientation='h',
+                    title="Average Forecast Accuracy by Brand",
+                    color='Avg_Accuracy', color_continuous_scale='RdYlGn')
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("Accuracy vs Sales Volume by Brand")
+        fig = px.scatter(brand_summary, x='Total_Sales', y='Avg_Accuracy', size='SKU_Count',
+                        color='Brand', hover_data=['Avg_Bias'],
+                        title="Brand Performance: Accuracy vs Sales Volume")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Detailed Brand Table
+    st.subheader("Detailed Brand Performance")
+    st.dataframe(brand_summary, use_container_width=True)
 
-def show_data_issues(analyzer):
-    """Halaman issues data"""
-    st.header("🚨 Data Quality Issues")
+def show_monthly_trends(analyzer):
+    """Halaman trend bulanan"""
+    st.header("📈 Monthly Accuracy Trends")
     
-    issues = analyzer.find_data_issues()
+    accuracy_df = analyzer.calculate_forecast_accuracy()
     
-    if issues:
-        for issue in issues:
-            st.error(issue)
-        
-        # Detailed analysis
-        if not analyzer.sales_data.empty and not analyzer.master_data.empty:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Missing Master Data Mappings")
-                sales_skus = set(analyzer.sales_data['SKU_SAP'].dropna())
-                master_skus = set(analyzer.master_data['SKU_SAP'].dropna())
-                missing_master = sales_skus - master_skus
-                
-                if missing_master:
-                    missing_df = analyzer.sales_data[analyzer.sales_data['SKU_SAP'].isin(missing_master)]
-                    st.dataframe(missing_df[['Current_SKU', 'SKU_SAP', 'SKU_Name']].head(10))
-                else:
-                    st.info("✅ No missing mappings found")
-            
-            with col2:
-                st.subheader("SKUs with No Sales")
-                sales_cols = [col for col in analyzer.sales_data.columns if col.startswith('Sales_')]
-                if sales_cols:
-                    zero_sales = analyzer.sales_data[sales_cols].sum(axis=1) == 0
-                    if zero_sales.any():
-                        zero_sales_df = analyzer.sales_data[zero_sales]
-                        st.dataframe(zero_sales_df[['Current_SKU', 'SKU_SAP', 'SKU_Name']].head(10))
-                    else:
-                        st.info("✅ No zero-sales SKUs found")
+    if accuracy_df.empty:
+        st.warning("Tidak ada data accuracy yang dapat dihitung")
+        return
     
-    else:
-        st.success("✅ No major data issues found!")
+    monthly_trend = analyzer.get_monthly_accuracy_trend(accuracy_df)
+    
+    if monthly_trend.empty:
+        st.warning("Tidak ada data trend bulanan")
+        return
+    
+    # Monthly Accuracy Trend
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Monthly Accuracy Trend")
+        fig = px.line(monthly_trend, x='Month', y='Avg_Accuracy',
+                     title="Average Monthly Forecast Accuracy Trend")
+        fig.add_scatter(x=monthly_trend['Month'], y=monthly_trend['Avg_Accuracy'], 
+                       mode='lines+markers', name='Accuracy')
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("Accuracy Variability by Month")
+        fig = px.bar(monthly_trend, x='Month', y='Std_Deviation',
+                    title="Accuracy Standard Deviation by Month")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Monthly details table
+    st.subheader("Monthly Accuracy Details")
+    st.dataframe(monthly_trend, use_container_width=True)
 
-def show_export_data(analyzer):
-    """Halaman export data"""
-    st.header("📥 Export Data")
+def show_issue_analysis(analyzer):
+    """Halaman analisis issue"""
+    st.header("🚨 Forecast Issue Analysis")
+    
+    accuracy_df = analyzer.calculate_forecast_accuracy()
+    
+    if accuracy_df.empty:
+        st.warning("Tidak ada data accuracy yang dapat dihitung")
+        return
+    
+    issues = analyzer.identify_forecast_issues(accuracy_df)
+    
+    # Display issues
+    for issue in issues:
+        st.error(issue)
+    
+    # Detailed issue analysis
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("SKUs with Poor Accuracy (<70%)")
+        poor_accuracy = accuracy_df[accuracy_df['Overall_Accuracy'] < 70]
+        if not poor_accuracy.empty:
+            st.dataframe(poor_accuracy[['SKU_SAP', 'Product_Name', 'Brand', 'Overall_Accuracy', 'Bias_Pct']]
+                        .sort_values('Overall_Accuracy'), use_container_width=True)
+        else:
+            st.success("✅ No SKUs with poor accuracy!")
+    
+    with col2:
+        st.subheader("High Bias SKUs (>|20%|)")
+        high_bias = accuracy_df[abs(accuracy_df['Bias_Pct']) > 20]
+        if not high_bias.empty:
+            st.dataframe(high_bias[['SKU_SAP', 'Product_Name', 'Brand', 'Overall_Accuracy', 'Bias_Pct']]
+                        .sort_values('Bias_Pct'), use_container_width=True)
+        else:
+            st.success("✅ No SKUs with high bias!")
+    
+    # Root cause analysis
+    st.subheader("📋 Root Cause Analysis Suggestions")
+    
+    st.markdown("""
+    **Common causes of poor forecast accuracy:**
+    - 🎯 **Data Quality Issues**: Missing historical data, outliers
+    - 📊 **Seasonality**: Unaccounted seasonal patterns
+    - 🚀 **New Products**: Lack of historical data for new SKUs
+    - 📈 **Promotional Effects**: Unplanned promotions affecting sales
+    - 🏭 **Supply Chain Issues**: Stockouts or overstock situations
+    - 🔄 **Model Limitations**: Forecasting model not capturing trends
+    """)
+
+def show_export_reports(analyzer):
+    """Halaman export laporan"""
+    st.header("📥 Export Forecast Accuracy Reports")
+    
+    accuracy_df = analyzer.calculate_forecast_accuracy()
+    
+    if accuracy_df.empty:
+        st.warning("Tidak ada data accuracy yang dapat dihitung")
+        return
+    
+    st.info("Download laporan forecast accuracy dalam berbagai format")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        if not analyzer.master_data.empty:
-            csv = analyzer.master_data.to_csv(index=False)
-            st.download_button(
-                label="📋 Download Master Data",
-                data=csv,
-                file_name="master_data.csv",
-                mime="text/csv"
-            )
+        # Export accuracy summary
+        summary_cols = ['SKU_SAP', 'Product_Name', 'Brand', 'Overall_Accuracy', 'Bias_Pct', 
+                       'Accuracy_Level', 'Total_Forecast', 'Total_Sales']
+        summary_df = accuracy_df[summary_cols]
+        
+        csv = summary_df.to_csv(index=False)
+        st.download_button(
+            label="📊 Download Accuracy Summary",
+            data=csv,
+            file_name="forecast_accuracy_summary.csv",
+            mime="text/csv"
+        )
     
     with col2:
-        if not analyzer.sales_data.empty:
-            csv = analyzer.sales_data.to_csv(index=False)
+        # Export brand performance
+        brand_summary = analyzer.get_brand_accuracy_summary(accuracy_df)
+        if not brand_summary.empty:
+            csv = brand_summary.to_csv(index=False)
             st.download_button(
-                label="📈 Download Sales Data",
+                label="🏷️ Download Brand Performance",
                 data=csv,
-                file_name="sales_data.csv",
+                file_name="brand_accuracy_performance.csv",
                 mime="text/csv"
             )
     
     with col3:
-        accuracy_df = analyzer.calculate_forecast_accuracy()
-        if not accuracy_df.empty:
-            csv = accuracy_df.to_csv(index=False)
+        # Export issues report
+        poor_accuracy = accuracy_df[accuracy_df['Overall_Accuracy'] < 70]
+        if not poor_accuracy.empty:
+            csv = poor_accuracy[summary_cols].to_csv(index=False)
             st.download_button(
-                label="🎯 Download Accuracy Report",
+                label="🚨 Download Issues Report",
                 data=csv,
-                file_name="accuracy_report.csv",
+                file_name="forecast_accuracy_issues.csv",
                 mime="text/csv"
             )
+    
+    # Preview of data to be exported
+    st.subheader("Data Preview")
+    st.dataframe(accuracy_df[['SKU_SAP', 'Product_Name', 'Brand', 'Overall_Accuracy', 'Accuracy_Level']].head(10))
 
 if __name__ == "__main__":
     main()
