@@ -19,7 +19,7 @@ SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1PuoII49N-IWOaNO8fSMYG
 # Nama Tab di Google Sheet (WAJIB SAMA PERSIS)
 SHEET_CONFIG = {
     'rofo': 'Rofo',
-    'po': 'PO',
+    'po': 'PO', # Sekarang juga Horizontal
     'sales': 'Sales'
 }
 
@@ -70,9 +70,10 @@ def load_sheet_data(url, sheet_name):
         return pd.DataFrame()
 
 def extract_date_columns(columns):
-    """Mendeteksi kolom tanggal secara fleksibel (untuk Rofo/Sales)."""
+    """Mendeteksi kolom tanggal secara fleksibel (untuk Rofo/PO/Sales)."""
     date_cols = []
     for col in columns:
+        # Mencari format 202x-xx-xx atau nama bulan
         if re.search(r'(202\d)|(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', col): 
             date_cols.append(col)
     return date_cols
@@ -84,71 +85,74 @@ def extract_date_columns(columns):
 @st.cache_data
 def process_data(df_rofo, df_po, df_sales):
     """
-    Fungsi utama untuk memproses 3 data (Rofo Horizontal, PO Vertical, Sales Horizontal)
-    dan menggabungkannya berdasarkan SKU dan Bulan.
+    Fungsi utama untuk memproses 3 data (Rofo, PO, Sales) yang semuanya
+    berformat HORIZONTAL, lalu menggabungkannya berdasarkan SKU dan Bulan.
     """
     
+    # Kunci kolom untuk ROFO, PO, dan SALES (SKU harus sama)
+    sku_col = 'SKU SAP'
+
     # ========== A. PROCESS ROFO (HORIZONTAL) ==========
-    rofo_sku_col = 'SKU SAP'
-    if rofo_sku_col not in df_rofo.columns:
-        st.error(f"❌ Kolom '{rofo_sku_col}' tidak ditemukan di data Rofo.")
+    if sku_col not in df_rofo.columns:
+        st.error(f"❌ Kolom '{sku_col}' tidak ditemukan di data Rofo.")
         return pd.DataFrame()
         
-    month_cols = extract_date_columns(df_rofo.columns)
-    if not month_cols:
+    rofo_month_cols = extract_date_columns(df_rofo.columns)
+    if not rofo_month_cols:
         st.error("❌ Kolom bulan (tanggal) tidak ditemukan di data Rofo.")
         return pd.DataFrame()
 
-    id_cols = [c for c in df_rofo.columns if c not in month_cols]
+    rofo_id_cols = [c for c in df_rofo.columns if c not in rofo_month_cols]
     
     df_rofo_long = df_rofo.melt(
-        id_vars=id_cols, 
-        value_vars=month_cols,
+        id_vars=rofo_id_cols, 
+        value_vars=rofo_month_cols,
         var_name='Month_Raw', 
         value_name='ROFO_Qty'
-    ).rename(columns={rofo_sku_col: 'SKU'})
+    ).rename(columns={sku_col: 'SKU'})
     
     df_rofo_long['ROFO_Qty'] = pd.to_numeric(df_rofo_long['ROFO_Qty'], errors='coerce').fillna(0).clip(lower=0)
     df_rofo_long["Date"] = pd.to_datetime(df_rofo_long["Month_Raw"], errors='coerce').dt.to_period('M')
     df_rofo_final = df_rofo_long.groupby(["SKU", "Date"])['ROFO_Qty'].sum().reset_index()
 
 
-    # ========== B. PROCESS PO (VERTICAL) ==========
-    po_date_col = 'Document Date'
-    po_sku_col = 'SKU SAP'
-    po_qty_col = 'Quantity'
-    
-    if po_date_col not in df_po.columns or po_sku_col not in df_po.columns:
-        st.error("❌ Kolom kunci PO ('Document Date' atau 'SKU SAP') tidak ditemukan.")
+    # ========== B. PROCESS PO (NOW HORIZONTAL) ==========
+    if sku_col not in df_po.columns:
+        st.error(f"❌ Kolom '{sku_col}' tidak ditemukan di data PO.")
+        return pd.DataFrame()
+        
+    po_month_cols = extract_date_columns(df_po.columns)
+    if not po_month_cols:
+        st.error("❌ Kolom bulan (tanggal) tidak ditemukan di data PO.")
         return pd.DataFrame()
 
-    if po_qty_col not in df_po.columns:
-         if 'Order Quantity' in df_po.columns:
-             po_qty_col = 'Order Quantity'
-             st.info("ℹ️ Menggunakan kolom 'Order Quantity' sebagai Kuantitas PO.")
-         else:
-             st.error("❌ Kolom kuantitas PO ('Quantity' atau 'Order Quantity') tidak ditemukan.")
-             return pd.DataFrame()
-
-    df_po['Month'] = pd.to_datetime(df_po[po_date_col], errors='coerce').dt.to_period('M')
-    df_po['Actual_Qty'] = pd.to_numeric(df_po[po_qty_col], errors='coerce').fillna(0)
+    po_id_cols = [c for c in df_po.columns if c not in po_month_cols]
     
-    df_po_final = df_po.groupby([po_sku_col, 'Month'])['Actual_Qty'].sum().reset_index().rename(columns={po_sku_col: 'SKU', 'Month': 'Date'})
+    df_po_long = df_po.melt(
+        id_vars=po_id_cols, 
+        value_vars=po_month_cols,
+        var_name='Month_Raw', 
+        value_name='Actual_Qty'
+    ).rename(columns={sku_col: 'SKU'})
+    
+    df_po_long['Actual_Qty'] = pd.to_numeric(df_po_long['Actual_Qty'], errors='coerce').fillna(0).clip(lower=0)
+    df_po_long["Date"] = pd.to_datetime(df_po_long["Month_Raw"], errors='coerce').dt.to_period('M')
+    df_po_final = df_po_long.groupby(["SKU", "Date"])['Actual_Qty'].sum().reset_index()
+    # Output: df_po_final dengan kolom ['SKU', 'Date', 'Actual_Qty']
 
 
-    # ========== C. PROCESS SALES (SECONDARY METRIC) ==========
-    sales_sku_col = 'SKU SAP'
+    # ========== C. PROCESS SALES (HORIZONTAL) ==========
     df_sales_final = pd.DataFrame()
     
-    if not df_sales.empty and sales_sku_col in df_sales.columns:
+    if not df_sales.empty and sku_col in df_sales.columns:
         sales_month_cols = extract_date_columns(df_sales.columns)
         if sales_month_cols:
             df_sales_long = df_sales.melt(
-                id_vars=[sales_sku_col], 
+                id_vars=[sku_col], 
                 value_vars=sales_month_cols, 
                 var_name='Month_Raw', 
                 value_name='Sales_Qty_Ref'
-            ).rename(columns={sales_sku_col: 'SKU'})
+            ).rename(columns={sku_col: 'SKU'})
             
             df_sales_long['Sales_Qty_Ref'] = pd.to_numeric(df_sales_long['Sales_Qty_Ref'], errors='coerce').fillna(0).clip(lower=0)
             df_sales_long['Date'] = pd.to_datetime(df_sales_long['Month_Raw'], errors='coerce').dt.to_period('M')
@@ -156,12 +160,16 @@ def process_data(df_rofo, df_po, df_sales):
 
 
     # ========== D. MERGING & METRICS ==========
+    # Merge PO dan ROFO
     df_merged = pd.merge(df_rofo_final, df_po_final, on=['SKU', 'Date'], how='outer').fillna(0)
+    
+    # Merge dengan Sales
     df_merged = pd.merge(df_merged, df_sales_final, on=['SKU', 'Date'], how='left').fillna(0)
     
+    # Hanya ambil baris yang ada aktivitas (Qty > 0)
     df_merged = df_merged[(df_merged['ROFO_Qty'] != 0) | (df_merged['Actual_Qty'] != 0) | (df_merged['Sales_Qty_Ref'] != 0)]
     
-    # Metrics
+    # Metrics Calculation
     def calc_far(row):
         return row['Actual_Qty'] / row['ROFO_Qty'] if row['ROFO_Qty'] > 0 else 0.0
     
@@ -332,9 +340,9 @@ def create_dashboard(df):
 def main():
     st.sidebar.title("📌 Final Checklist")
     st.sidebar.markdown("""
-    **1. Secrets:** Pastikan Private Key Service Account di-copy ke Streamlit Secrets (format satu baris).
-    **2. Sharing:** Pastikan email `test-66@...` di-Share (Viewer) ke GSheet ini.
-    **3. Tab Name:** Pastikan tab di GSheet bernama `Rofo`, `PO`, `Sales`.
+    **1. Secrets:** Pastikan Private Key Service Account di-copy ke Streamlit Secrets.
+    **2. Sharing:** Pastikan email Service Account sudah di-Share (Viewer) ke GSheet.
+    **3. Tab Name:** Pastikan tab di GSheet bernama `Rofo`, `PO` (sekarang Horizontal), `Sales`.
     """)
     
     st.title("📈 Forecast Accuracy & Performance Dashboard")
@@ -350,6 +358,7 @@ def main():
         st.error("⚠️ Dashboard tidak dapat ditampilkan. Cek pesan error di atas (Koneksi GSheet).")
         return
 
+    # Panggil fungsi processing yang sudah diperbarui
     df_final = process_data(df_rofo, df_po, df_sales)
 
     # --- 3. DISPLAY ---
